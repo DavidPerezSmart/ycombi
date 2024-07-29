@@ -6,10 +6,17 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException, NoSuchWindowException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
 import pandas as pd
 import time
+from datetime import datetime
+import logging
+from collections import defaultdict
+
+# Configurar logging
+logging.basicConfig(filename='ycombinator_scraper.log', level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
 # URL del recurso de datos
 algolia_url = "https://45bwzj1sgc-dsn.algolia.net/1/indexes/*/queries"
@@ -23,41 +30,87 @@ params = {
 
 # Configuración de Selenium
 options = Options()
-options.headless = True  # Ejecuta el navegador en modo headless (sin interfaz gráfica)
+options.headless = True
 driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-wait = WebDriverWait(driver, 10)
+wait = WebDriverWait(driver, 20)
 
-# Función para extraer información adicional de la página de la empresa
-def extract_additional_info(url):
+def extract_additional_info(url, company_name):
     driver.get(url)
-    founders_data = []
+    company_data = []
+    
     try:
-        # Esperar a que la sección de fundadores esté presente
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "section div.space-y-5 div.flex-row")))
-        founders_info = driver.find_elements(By.CSS_SELECTOR, "section div.space-y-5 div.flex-row")
+        # Esperar hasta que el div con la clase 'ycdc-card' esté presente
+        company_card = wait.until(EC.presence_of_element_located((By.CLASS_NAME, 'ycdc-card')))
+        
+        # Obtener LinkedIn de la empresa
+        company_linkedin = "N/A"
+        try:
+            linkedin_element = company_card.find_element(By.XPATH, ".//a[contains(@aria-label, 'LinkedIn profile')]")
+            company_linkedin = linkedin_element.get_attribute("href")
+        except NoSuchElementException:
+            logging.info(f"No LinkedIn profile found for company: {company_name}")
+        
+        # Agregar datos de la empresa
+        company_data.append({
+            "Nombre empresa": company_name,
+            "LinkedIn": company_linkedin,
+            "Fundador nombre": "Company",
+            "Cargo del fundador": "Company"
+        })
+        
+        # Intentar obtener información de los fundadores
+        try:
+            founders_info = wait.until(EC.presence_of_all_elements_located((By.CLASS_NAME, 'leading-snug')))
+            
+            for founder in founders_info:
+                founder_data = {
+                    "Nombre empresa": company_name,
+                    "LinkedIn": "N/A",
+                    "Fundador nombre": "N/A",
+                    "Cargo del fundador": "N/A"
+                }
+                
+                try:
+                    name_element = founder.find_element(By.CLASS_NAME, "font-bold")
+                    founder_data["Fundador nombre"] = name_element.text if name_element else "N/A"
+                    
+                    position_elements = founder.find_elements(By.TAG_NAME, "div")
+                    if len(position_elements) >= 2:
+                        pos = position_elements[1].text
+                        if pos in ["Founder", "CEO", "CTO", "CPO"]:
+                            founder_data["Cargo del fundador"] = pos
+                    
+                    # Buscar LinkedIn del fundador en un div específico
+                    try:
+                        linkedin_element = founder.find_element(By.XPATH, ".//div[contains(@class, 'mt-1 space-x-2')]//a[contains(@aria-label, 'LinkedIn profile')]")
+                        founder_data["LinkedIn"] = linkedin_element.get_attribute("href")
+                    except NoSuchElementException:
+                        logging.info(f"No LinkedIn profile found for founder {founder_data['Fundador nombre']}")
+                    
+                    company_data.append(founder_data)
+                except Exception as e:
+                    logging.error(f"Error extracting founder info for {company_name}: {e}")
+        except TimeoutException:
+            logging.info(f"No founder data found for company: {company_name}")
+    
+    except TimeoutException:
+        logging.error(f"Timeout while loading page for company: {company_name}, URL: {url}")
+    except Exception as e:
+        logging.error(f"Unexpected error for company {company_name}: {e}")
+    
+    return company_data
 
-        for founder in founders_info:
-            try:
-                name_element = founder.find_element(By.CSS_SELECTOR, "h3.text-lg.font-bold")
-                name = name_element.text.split(",")[0].strip()  # Obtener el nombre del fundador
-                position = name_element.text.split(",")[1].strip()  # Obtener el cargo del fundador
-                linkedin_element = founder.find_element(By.CSS_SELECTOR, "a[aria-label='LinkedIn profile']")
-                linkedin_url = linkedin_element.get_attribute("href")
-                founders_data.append({
-                    "Fundador nombre": name,
-                    "Cargo del fundador": position,
-                    "LinkedIn Personaldel fundador": linkedin_url
-                })
-            except (NoSuchElementException, StaleElementReferenceException) as e:
-                print(f"Error extracting founder info: {e}")
-    except (NoSuchElementException, StaleElementReferenceException, NoSuchWindowException) as e:
-        print(f"Error loading founders section: {e}")
-    return founders_data
+# Función para convertir las fechas
+def convert_timestamp(timestamp):
+    return datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d') if timestamp else "N/A"
 
-# Lista para almacenar todos los datos de las empresas
+# Lista para almacenar los datos de todas las empresas
 all_companies = []
 
-# Iterar sobre todas las páginas de resultados
+# Diccionario para almacenar las empresas por batch
+companies_by_batch = defaultdict(list)
+
+# Iterar sobre todas las páginas de resultados para obtener todas las empresas
 page = 0
 while True:
     response = requests.post(algolia_url, json={"requests":[{"indexName":"YCCompany_production","params":f"query=&hitsPerPage=100&maxValuesPerFacet=100&page={page}&facets=%5B%5D&tagFilters="}]}, params=params)
@@ -65,33 +118,41 @@ while True:
     hits = data.get('results', [])[0].get('hits', [])
     
     if not hits:
-        break  # Salir del bucle si no hay más resultados
+        break
     
     for hit in hits:
+        batch = hit.get('batch', 'Unknown')
         company_url = f"https://www.ycombinator.com/companies/{hit.get('slug')}"
-        additional_info = extract_additional_info(company_url)
+        company_name = hit.get('name')
         
-        for founder in additional_info:
-            company = {
-                "Nombre empresa": hit.get('name'),
-                "Hiring (Yes/No)": hit.get('isHiring'),
-                "Correo Fundador": "",  # Este dato no está en la respuesta de Algolia
-                "URL statup": hit.get('website'),
-                "LinkedIn Empresa": "",  # Este dato no está en la respuesta de Algolia
-                "Fundador nombre": founder["Fundador nombre"],
-                "Cargo del fundador": founder["Cargo del fundador"],
-                "LinkedIn Personaldel fundador": founder["LinkedIn Personaldel fundador"],
-                "Fecha del fundador": hit.get('launched_at')
-            }
-            all_companies.append(company)
+        logging.info(f"Scraping company: {company_name}")
+        
+        company_data = extract_additional_info(company_url, company_name)
+        
+        for entry in company_data:
+            entry.update({
+                "Hiring (Yes/No)": "Yes" if hit.get('isHiring') else "No",
+                "URL startup": hit.get('website', 'N/A'),
+                "Fecha del fundador": convert_timestamp(hit.get('launched_at')),
+                "Batch": batch
+            })
+        
+        companies_by_batch[batch].extend(company_data)
     
     page += 1
+    time.sleep(2)
 
-# Cierra el navegador
-driver.quit()
+# Ordenar los batches de manera descendente
+sorted_batches = sorted(companies_by_batch.keys(), reverse=True)
 
-# Crea un DataFrame con los datos obtenidos
+# Crear un DataFrame con todos los datos ordenados por batch
+all_companies = []
+for batch in sorted_batches:
+    all_companies.extend(companies_by_batch[batch])
+
 df = pd.DataFrame(all_companies)
 
-# Guarda los datos en un archivo Excel
-df.to_excel("ycombinator_companies.xlsx", index=False)
+# Crear un archivo Excel con todos los datos en una sola hoja
+df.to_excel("ycombinator_companies_sorted.xlsx", index=False)
+
+logging.info("Scraping completed. Data saved to ycombinator_companies_sorted.xlsx")
